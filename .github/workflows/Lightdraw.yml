@@ -1,0 +1,75 @@
+name: Build Android APK (from lightdraw.zip)
+
+on:
+  push:
+    branches: [main]
+  release:
+    types: [published]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Extract lightdraw.zip
+        run: |
+          test -f lightdraw.zip || { echo "lightdraw.zip tidak ada di root repo"; exit 1; }
+          rm -rf work && mkdir work
+          unzip -q lightdraw.zip -d work
+          ls work/lightdraw
+
+      - name: Setup JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,armv7-linux-androideabi
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: work/lightdraw/rust
+
+      - name: Install cargo-ndk
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-ndk
+
+      - name: Build native engine (arm64-v8a, armeabi-v7a)
+        working-directory: work/lightdraw/rust
+        run: >
+          cargo ndk --platform 29
+          -t arm64-v8a -t armeabi-v7a
+          -o ../app/src/main/jniLibs
+          build --release
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.9"
+
+      - name: Build release APK
+        working-directory: work/lightdraw
+        run: gradle assembleRelease --no-daemon --stacktrace
+
+      - name: Package app-release.zip
+        working-directory: work/lightdraw
+        run: |
+          mkdir -p dist/native-libs
+          cp app/build/outputs/apk/release/*.apk dist/
+          cp -r app/src/main/jniLibs/. dist/native-libs/
+          (cd dist && zip -r ../app-release.zip .)
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-release
+          path: work/lightdraw/app-release.zip
+          if-no-files-found: error
