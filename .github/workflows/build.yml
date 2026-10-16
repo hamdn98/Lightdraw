@@ -1,0 +1,142 @@
+name: Build LightDraw
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  NDK_VERSION: 26.1.10909125
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Extract project ZIP
+        run: |
+          set -e
+          ZIP=$(ls *.zip | head -n1)
+          echo "pakai zip: $ZIP"
+          unzip -q "$ZIP" -d _unzipped
+          # cari folder yang punya settings.gradle.kts
+          ROOT=$(find _unzipped -maxdepth 3 -name 'settings.gradle.kts' | head -n1 | xargs dirname)
+          echo "root asli: $ROOT"
+          mv "$ROOT" src
+          ls -la src
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Setup Android SDK & NDK
+        run: |
+          set -e
+          yes | $ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager --licenses > /dev/null || true
+          $ANDROID_SDK_ROOT/cmdline-tools/latest/bin/sdkmanager \
+            "ndk;${NDK_VERSION}" \
+            "platform-tools" \
+            "platforms;android-34" \
+            "build-tools;34.0.0"
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,armv7-linux-androideabi,x86_64-linux-android
+
+      - name: Cache Rust
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            src/rust-engine/target
+          key: rust-${{ hashFiles('**/Cargo.toml','**/Cargo.lock') }}
+          restore-keys: rust-
+
+      - name: Cache Gradle
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-${{ hashFiles('**/*.gradle*','**/gradle-wrapper.properties') }}
+          restore-keys: gradle-
+
+      - name: Configure Cargo for Android NDK
+        run: |
+          NDK_HOME="$ANDROID_SDK_ROOT/ndk/${NDK_VERSION}"
+          TOOLCHAIN="$NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64"
+          mkdir -p ~/.cargo
+          cat > ~/.cargo/config.toml << EOF
+          [target.aarch64-linux-android]
+          ar = "$TOOLCHAIN/bin/llvm-ar"
+          linker = "$TOOLCHAIN/bin/aarch64-linux-android24-clang"
+
+          [target.armv7-linux-androideabi]
+          ar = "$TOOLCHAIN/bin/llvm-ar"
+          linker = "$TOOLCHAIN/bin/armv7a-linux-androideabi24-clang"
+
+          [target.x86_64-linux-android]
+          ar = "$TOOLCHAIN/bin/llvm-ar"
+          linker = "$TOOLCHAIN/bin/x86_64-linux-android24-clang"
+          EOF
+          cat ~/.cargo/config.toml
+
+      - name: Build Rust engine
+        working-directory: src/rust-engine
+        run: |
+          set -e
+          declare -A ABI_MAP=(
+            [aarch64-linux-android]=arm64-v8a
+            [armv7-linux-androideabi]=armeabi-v7a
+            [x86_64-linux-android]=x86_64
+          )
+          for target in "${!ABI_MAP[@]}"; do
+            echo "::group::build $target"
+            cargo build --release --target "$target"
+            echo "::endgroup::"
+            abi="${ABI_MAP[$target]}"
+            jni="../app/src/main/jniLibs/$abi"
+            mkdir -p "$jni"
+            cp "target/$target/release/liblightdraw_engine.so" "$jni/"
+          done
+          find ../app/src/main/jniLibs -name '*.so' -exec ls -lh {} \;
+
+      - name: Generate Gradle wrapper kalau belum ada
+        working-directory: src
+        run: |
+          if [ ! -f ./gradlew ]; then
+            echo "gradlew tak ada, generate..."
+            gradle wrapper --gradle-version 8.7
+          fi
+          chmod +x ./gradlew
+
+      - name: Build debug APK
+        working-directory: src
+        run: ./gradlew assembleDebug --no-daemon --stacktrace
+
+      - name: Upload debug APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: lightdraw-debug
+          path: src/app/build/outputs/apk/debug/*.apk
+          retention-days: 14
+
+      - name: Upload log kalau gagal
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs
+          path: |
+            src/**/build/reports/**
+          if-no-files-found: ignore
